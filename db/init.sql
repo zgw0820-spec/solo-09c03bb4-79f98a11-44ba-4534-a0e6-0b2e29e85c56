@@ -34,4 +34,19 @@ CREATE TABLE IF NOT EXISTS index_build_jobs (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One row per acknowledged fault event. event_id is a hash of the exact log
+-- set, so a later extension/merge yields a different id and can never inherit
+-- this acknowledgment. The API also creates this table on startup so that
+-- databases initialized before this feature keep working.
+CREATE TABLE IF NOT EXISTS fault_event_acks (
+    device_id       TEXT        NOT NULL,
+    event_id        TEXT        NOT NULL,
+    first_log_id    BIGINT      NOT NULL,
+    last_log_id     BIGINT      NOT NULL,
+    log_ids         BIGINT[]    NOT NULL,
+    acked_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_by TEXT,
+    PRIMARY KEY (device_id, event_id)
+);
+
 VACUUM ANALYZE device_fault_logs;

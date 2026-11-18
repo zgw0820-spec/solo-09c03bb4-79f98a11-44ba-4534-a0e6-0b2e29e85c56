@@ -17,6 +17,10 @@ Runs against two live API instances and a real PostgreSQL and verifies:
   P5  startup reconcile marks the orphaned build failed; restarts keep the
       tracked state consistent with the actual index
   P6  the device/time-range query plan uses the new index
+  P7  fault-event grouping, acknowledgment idempotency, and invalidation on
+      backfill; 24 h range limit; concurrent critical writes vs. ack across
+      both instances; a failed critical write leaves the event unchanged;
+      other devices are unaffected; /logs and index build keep working
 
 Modes:
   local   spawns/kills two local uvicorn processes (used in this sandbox)
@@ -37,6 +41,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 
@@ -541,6 +546,364 @@ def phase_p6(ctx):
           code == 200 and INDEX_NAME in plan, plan[:200])
 
 
+# ---------------------------------------------------------------------------
+# P7: fault events + acknowledgment
+# ---------------------------------------------------------------------------
+
+EVENT_WINDOW = "start=2026-01-01T00:00:00Z&end=2026-01-01T12:00:00Z"
+
+
+def device(name):
+    return f"{name}-{uuid.uuid4().hex[:8]}"
+
+
+def event_time(minutes):
+    return (datetime(2026, 1, 1, 6, 0, tzinfo=timezone.utc)
+            + timedelta(minutes=minutes)).isoformat()
+
+
+def write_critical(base, dev, minutes, severity="critical"):
+    return http("POST", base, "/logs", {
+        "device_id": dev, "message": f"at {minutes}",
+        "severity": severity, "occurred_at": event_time(minutes),
+    })
+
+
+def get_events(base, dev):
+    code, r = http("GET", base, f"/events?device_id={dev}&{EVENT_WINDOW}")
+    return code, r
+
+
+def phase_p7(ctx):
+    print("\n== P7: fault events + acknowledgment ==")
+    b1, b2 = ctx["bases"]["api1"], ctx["bases"]["api2"]
+
+    # -- grouping threshold -------------------------------------------------
+    dev = device("evt-threshold")
+    for m in (0, 1):
+        code, _ = write_critical(b1, dev, m)
+        check(f"P7 write critical #{m}", code == 201)
+    code, r = get_events(b2, dev)
+    check("P7 two critical logs do not form an event",
+          code == 200 and r["count"] == 0, str(r))
+    write_critical(b1, dev, 2)
+    code, r = get_events(b1, dev)
+    check("P7 three critical logs within 5 min form one event",
+          code == 200 and r["count"] == 1 and r["events"][0]["log_count"] == 3,
+          str(r))
+
+    # -- gap rule / severity filter ----------------------------------------
+    write_critical(b1, dev, 20)
+    write_critical(b1, dev, 21, severity="error")
+    write_critical(b1, dev, 22, severity="warn")
+    code, r = get_events(b1, dev)
+    check("P7 a 18-min gap separates runs; single-log run is not an event",
+          code == 200 and r["count"] == 1 and r["events"][0]["log_count"] == 3,
+          str(r))
+
+    # -- acknowledgment: exact set, idempotent ------------------------------
+    ev = r["events"][0]
+    code, ack1 = http("POST", b2, "/events/ack", {
+        "device_id": dev, "event_id": ev["event_id"],
+        "log_ids": ev["log_ids"], "acknowledged_by": "op-1",
+    })
+    check("P7 ack accepts the exact seen log set",
+          code == 200 and ack1["acknowledged"]
+          and ack1["already_acknowledged"] is False, str(ack1))
+    code, ack2 = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": ev["event_id"],
+        "log_ids": list(reversed(ev["log_ids"])), "acknowledged_by": "op-2",
+    })
+    check("P7 repeat ack (other instance) is idempotent",
+          code == 200 and ack2["already_acknowledged"] is True
+          and ack2["acknowledged_at"] == ack1["acknowledged_at"],
+          str(ack2))
+    code, r = get_events(b2, dev)
+    shown = r["events"][0]
+    check("P7 event is reported acknowledged with who/when",
+          shown["acknowledged"] and shown["acknowledged_by"] == "op-1"
+          and shown["acknowledged_at"], str(shown))
+    check("P7 ack response carries start/end/log ids",
+          ack1["start"] == ev["start"] and ack1["end"] == ev["end"]
+          and ack1["log_ids"] == ev["log_ids"], str(ack1))
+
+    # -- backfill that extends the event invalidates the old ack ------------
+    code, _ = write_critical(b2, dev, 3)   # inside what is now a 0..3 run
+    code, r = get_events(b1, dev)
+    ext = r["events"][0]
+    check("P7 backfilled log extends the event",
+          ext["log_count"] == 4 and ext["event_id"] != ev["event_id"], str(ext))
+    check("P7 old ack no longer applies to the extended event",
+          ext["acknowledged"] is False)
+    code, err = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": ev["event_id"],
+        "log_ids": ev["log_ids"],
+    })
+    check("P7 old event id can no longer acknowledge the changed event",
+          code == 409, f"{code} {err}")
+    code, err = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": ev["event_id"],
+        "log_ids": ext["log_ids"],
+    })
+    check("P7 old event id cannot be replayed with the new log set",
+          code == 409, f"{code} {err}")
+    code, err = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": ext["event_id"],
+        "log_ids": ev["log_ids"],
+    })
+    check("P7 new event id requires the complete new log set",
+          code == 409, f"{code} {err}")
+    code, ack = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": ext["event_id"],
+        "log_ids": ext["log_ids"],
+    })
+    check("P7 the new event can be acknowledged", code == 200, str(ack))
+
+    # -- backfill that merges two events invalidates both acks --------------
+    dev = device("evt-merge")
+    for m in (0, 2, 4):
+        write_critical(b1, dev, m)
+    for m in (30, 32, 34):
+        write_critical(b2, dev, m)
+    code, r = get_events(b1, dev)
+    check("P7 two separated runs form two events", r["count"] == 2, str(r))
+    acks = []
+    for ev in r["events"]:
+        code, a = http("POST", b2, "/events/ack", {
+            "device_id": dev, "event_id": ev["event_id"],
+            "log_ids": ev["log_ids"]})
+        check("P7 ack event before merge", code == 200, str(a))
+        acks.append(a["event_id"])
+    write_critical(b1, dev, 5)   # extends the first run (0..5); still 25 to 30
+    code, r = get_events(b1, dev)
+    check("P7 a backfill that only extends leaves two events",
+          r["count"] == 2 and sorted(e["log_count"] for e in r["events"]) == [3, 4],
+          str(r))
+    write_critical(b2, dev, 20)
+    code, r = get_events(b2, dev)
+    check("P7 a lone backfill 15 min from both sides still does not merge",
+          r["count"] == 2, str(r))
+    write_critical(b1, dev, 8)
+    write_critical(b2, dev, 12)
+    write_critical(b1, dev, 16)
+    code, r = get_events(b2, dev)
+    check("P7 partial bridging still keeps the runs separate",
+          r["count"] == 2, str(r))
+    write_critical(b1, dev, 24)
+    write_critical(b2, dev, 28)  # 4 -> 8 -> 12 -> 16 -> 20 -> 24 -> 28 -> 30
+    code, r = get_events(b2, dev)
+    merged = r["events"][0] if r["count"] == 1 else None
+    check("P7 bridging logs merge the runs into one event",
+          merged is not None and merged["log_count"] == 13, str(r))
+    check("P7 merged event inherits neither old acknowledgment",
+          merged["acknowledged"] is False)
+    for old in acks:
+        code, err = http("POST", b1, "/events/ack", {
+            "device_id": dev, "event_id": old,
+            "log_ids": merged["log_ids"]})
+        check("P7 pre-merge event id rejected for merged event",
+              code == 409, f"{code} {err}")
+
+    # -- range / tenant validation -----------------------------------------
+    code, err = http("GET", b1, f"/events?device_id={dev}"
+                     "&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:01Z")
+    check("P7 >24 h range rejected", code == 422, f"{code} {err}")
+    code, err = http("GET", b1, f"/events?device_id={dev}"
+                     "&start=2026-01-02T00:00:00Z&end=2026-01-01T00:00:00Z")
+    check("P7 inverted range rejected", code == 422, f"{code} {err}")
+    code, err = http("POST", b2, "/events/ack", {
+        "device_id": device("other"), "event_id": merged["event_id"],
+        "log_ids": merged["log_ids"]})
+    check("P7 event id / log ids are scoped to their device", code == 409,
+          f"{code} {err}")
+
+    # -- window straddle returns the whole event ---------------------------
+    code, r = http("GET", b1, f"/events?device_id={dev}"
+                   "&start=2026-01-01T06:10:00Z&end=2026-01-01T06:20:00Z")
+    check("P7 window touching the middle still returns the whole event",
+          r["count"] == 1 and r["events"][0]["log_count"] == 13, str(r))
+    check("P7 event id and start/end do not depend on the query window",
+          r["events"][0]["event_id"] == merged["event_id"]
+          and r["events"][0]["start"] == merged["start"]
+          and r["events"][0]["end"] == merged["end"], str(r))
+
+    # -- concurrency: two instances, critical writes vs. ack ---------------
+    print("  .. concurrent critical writes vs. ack across both instances")
+    dev = device("evt-race")
+    base_ids = []
+    for m in (0, 2, 4):
+        code, _ = write_critical(b1, dev, m)
+        code, r = get_events(b1, dev)
+    ev = r["events"][0]
+    original = ev["event_id"]
+    original_ids = list(ev["log_ids"])
+
+    def ack_task(base):
+        return http("POST", base, "/events/ack", {
+            "device_id": dev, "event_id": original,
+            "log_ids": original_ids})
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futures = [ex.submit(ack_task, b1 if i % 2 == 0 else b2)
+                   for i in range(8)]
+        # Backfill a log in the middle of the run concurrently.
+        futures.append(ex.submit(write_critical, b2, dev, 3))
+        results = [f.result() for f in futures]
+
+    ack_codes = [c for c, _ in results[:8]]
+    write_code = results[8][0]
+    check("P7 concurrent backfill write succeeded", write_code == 201,
+          str(results[8]))
+    check("P7 concurrent acks: at least one succeeded and repeated acks are "
+          "idempotent, stale-id acks are 409",
+          all(c in (200, 409) for c in ack_codes) and 200 in ack_codes,
+          str(ack_codes))
+    code, r = get_events(b2, dev)
+    final = r["events"][0]
+    check("P7 concurrent result is internally consistent",
+          final["log_count"] == 4
+          and ((final["event_id"] == original and final["acknowledged"])
+               or (final["event_id"] != original
+                   and not final["acknowledged"])),
+          str(final))
+    tally = {"ok": sum(1 for c in ack_codes if c == 200),
+             "conflict": sum(1 for c in ack_codes if c == 409)}
+    info(f"concurrent acks: {tally}")
+
+    # -- failed write must not affect the event ---------------------------
+    dev = device("evt-failwrite")
+    for m in (0, 2, 4):
+        write_critical(b1, dev, m)
+    code, r = get_events(b1, dev)
+    before = r["events"][0]
+    code, err = http("POST", b1, "/logs", {
+        "device_id": dev, "message": "", "severity": "critical",
+        "occurred_at": event_time(3),
+    })
+    check("P7 malformed critical write is rejected", code == 422,
+          f"{code} {err}")
+    code, r = get_events(b2, dev)
+    after = r["events"][0]
+    check("P7 failed write leaves the event unchanged",
+          after["event_id"] == before["event_id"]
+          and after["log_ids"] == before["log_ids"], str(after))
+    code, ack = http("POST", b1, "/events/ack", {
+        "device_id": dev, "event_id": before["event_id"],
+        "log_ids": before["log_ids"]})
+    check("P7 event remains acknowledgeable after the failed write",
+          code == 200, str(ack))
+
+    legacy_dev = device("evt-legacy")
+    write_critical(b1, legacy_dev, 0)
+
+    # -- other devices keep writing while one device is locked ------------
+    dev_a, dev_b = device("evt-lock-a"), device("evt-lock-b")
+    write_critical(b1, dev_a, 0)
+    write_critical(b1, dev_b, 0)
+
+    def hold_lock_then_release(seconds):
+        with psycopg.connect(ctx["dsn"], autocommit=False) as locker:
+            locker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, %s))",
+                (dev_a, 861_227_003))
+            time.sleep(seconds)
+            locker.rollback()
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    t0 = time.time()
+    holder.submit(hold_lock_then_release, 6)
+    time.sleep(1)  # let the holder acquire the lock
+    code_b, _ = write_critical(b2, dev_b, 1)   # different device
+    elapsed_b = time.time() - t0
+    code_a, _ = write_critical(b2, dev_a, 1)   # same device: must wait
+    elapsed_a = time.time() - t0
+    holder.shutdown(wait=True)
+    check("P7 write for another device is not blocked by a held device lock",
+          code_b == 201 and elapsed_b < 4, f"{elapsed_b:.1f}s")
+    check("P7 same-device write waits for the device lock",
+          code_a == 201 and elapsed_a >= 5, f"{elapsed_a:.1f}s")
+
+    # -- acknowledgment uses only committed logs ---------------------------
+    # A critical write that has taken the device lock but not committed must
+    # be invisible to an ack; if it rolls back, the event is unchanged.
+    dev = device("evt-inflight")
+    for m in (0, 2, 4):
+        write_critical(b1, dev, m)
+    code, r = get_events(b1, dev)
+    ev = r["events"][0]
+
+    inflight = psycopg.connect(ctx["dsn"], autocommit=False)
+    inflight.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, %s))",
+        (dev, 861_227_003))
+    inflight.execute(
+        "INSERT INTO device_fault_logs (device_id, occurred_at, severity, message)"
+        " VALUES (%s, %s, 'critical', 'in flight')",
+        (dev, event_time(3)))
+    # The row exists but is uncommitted, and the writer holds the device lock.
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(http, "POST", b2, "/events/ack", {
+            "device_id": dev, "event_id": ev["event_id"],
+            "log_ids": ev["log_ids"],
+        })
+        time.sleep(1.0)
+        check("P7 ack blocks while an uncommitted critical write holds the lock",
+              not fut.done())
+        inflight.rollback()  # writer fails -> its log disappears with the lock
+        code, ack = fut.result()
+    inflight.close()
+    check("P7 after the in-flight write rolls back, the old event is acked",
+          code == 200 and ack["event_id"] == ev["event_id"], f"{code} {ack}")
+    code, r = get_events(b2, dev)
+    check("P7 rolled-back write left no log behind",
+          r["events"][0]["log_ids"] == ev["log_ids"], str(r))
+
+    # A write that commits before the ack acquires the lock changes the event,
+    # so the ack must be rejected with 409.
+    dev = device("evt-commit-race")
+    for m in (0, 2, 4):
+        write_critical(b1, dev, m)
+    code, r = get_events(b1, dev)
+    ev = r["events"][0]
+    writer = psycopg.connect(ctx["dsn"], autocommit=False)
+    writer.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, %s))",
+        (dev, 861_227_003))
+    writer.execute(
+        "INSERT INTO device_fault_logs (device_id, occurred_at, severity, message)"
+        " VALUES (%s, %s, 'critical', 'committed while ack waits')",
+        (dev, event_time(3)))
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(http, "POST", b2, "/events/ack", {
+            "device_id": dev, "event_id": ev["event_id"],
+            "log_ids": ev["log_ids"],
+        })
+        time.sleep(1.0)
+        check("P7 ack waits for the committing writer's lock", not fut.done())
+        writer.commit()   # the log becomes visible before the ack validates
+        code, err = fut.result()
+    writer.close()
+    check("P7 a committed extending write makes the stale ack 409",
+          code == 409, f"{code} {err}")
+    code, r = get_events(b1, dev)
+    check("P7 the extended event is unacknowledged",
+          r["events"][0]["log_count"] == 4
+          and not r["events"][0]["acknowledged"], str(r))
+
+    # -- existing APIs still work after the event feature -----------------
+    code, r = http("GET", b2,
+                   f"/logs?device_id={legacy_dev}"
+                   f"&start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z")
+    check("P7 legacy /logs query still works", code == 200 and r["count"] == 1,
+          str(r.get("count")))
+    code, _ = http("GET", b1, f"/events/plan?device_id={legacy_dev}"
+                   f"&{EVENT_WINDOW}")
+    check("P7 events plan endpoint responds", code == 200)
+    code, st = http("GET", b2, "/indexes/status")
+    check("P7 online index still ready/valid", code == 200
+          and st.get("state") == "ready", str(st.get("state")))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["local", "docker"], required=True)
@@ -564,6 +927,7 @@ def main():
     ctx = {
         "mode": args.mode,
         "db": db,
+        "dsn": args.dsn,
         "instances": instances,
         "bases": {"api1": args.api1, "api2": args.api2},
         "workdir": args.workdir,
@@ -577,6 +941,7 @@ def main():
         phase_p4(ctx)
         phase_p5(ctx)
         phase_p6(ctx)
+        phase_p7(ctx)
     finally:
         passed = sum(1 for _, ok in RESULTS if ok)
         print(f"\n==== summary: {passed}/{len(RESULTS)} checks passed ====")
